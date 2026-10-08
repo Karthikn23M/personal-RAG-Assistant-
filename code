@@ -1,0 +1,97 @@
+import glob, os
+import streamlit as st
+from langchain_anthropic import ChatAnthropic
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_community.document_loaders import PyPDFLoader, TextLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_core.vectorstores import InMemoryVectorStore
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.messages import HumanMessage, AIMessage
+
+DOCS_DIR = "docs"
+EMBED_MODEL = "paraphrase-multilingual-MiniLM-L12-v2"  # English + Tamil + more
+LLM_MODEL = "claude-sonnet-5-5"
+CHUNK, OVERLAP, TOP_K = 800, 150, 4
+
+
+def load_docs():
+    docs = []
+    for path in sorted(glob.glob(f"{DOCS_DIR}/**/*", recursive=True)):
+        low = path.lower()
+        if low.endswith(".pdf"):
+            docs += PyPDFLoader(path).load()
+        elif low.endswith((".txt", ".md")):
+            docs += TextLoader(path, encoding="utf-8", autodetect_encoding=True).load()
+    return docs
+
+
+@st.cache_resource
+def get_embeddings():
+    return HuggingFaceEmbeddings(model_name=EMBED_MODEL, encode_kwargs={"normalize_embeddings": True})
+
+
+@st.cache_resource
+def build_retriever(signature):
+    docs = load_docs()
+    if not docs:
+        return None
+    splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK, chunk_overlap=OVERLAP)
+    chunks = splitter.split_documents(docs)
+    store = InMemoryVectorStore.from_documents(chunks, get_embeddings())
+    return store.as_retriever(search_kwargs={"k": TOP_K}), len(chunks)
+
+
+def format_docs(docs):
+    return "\n\n".join(
+        f"[{os.path.basename(d.metadata.get('source', 'unknown'))}]\n{d.page_content}" for d in docs
+    )
+
+
+prompt = ChatPromptTemplate.from_messages([
+    ("system",
+     "You are a personal assistant answering from the user's own notes. "
+     "Use only the context below. If the answer isn't there, say so. "
+     "Mention the source file names you relied on. Reply in the user's language.\n\n"
+     "CONTEXT:\n{context}"),
+    MessagesPlaceholder("history"),
+    ("human", "{question}"),
+])
+llm = ChatAnthropic(model=LLM_MODEL, max_tokens=1000)  # reads ANTHROPIC_API_KEY
+chain = prompt | llm | StrOutputParser()
+
+st.title("Personal RAG Chatbot (LangChain)")
+os.makedirs(DOCS_DIR, exist_ok=True)
+
+with st.sidebar:
+    up = st.file_uploader("Add documents", type=["txt", "md", "pdf"], accept_multiple_files=True)
+    for f in up or []:
+        with open(os.path.join(DOCS_DIR, f.name), "wb") as out:
+            out.write(f.getbuffer())
+    if st.button("Re-index"):
+        build_retriever.clear()
+
+files = sorted(p for p in glob.glob(f"{DOCS_DIR}/**/*", recursive=True) if os.path.isfile(p))
+sig = tuple((p, os.path.getmtime(p)) for p in files)
+built = build_retriever(sig)
+retriever, n_chunks = built if built else (None, 0)
+st.sidebar.caption(f"{len(files)} files · {n_chunks} chunks indexed")
+
+if "history" not in st.session_state:
+    st.session_state.history = []
+for m in st.session_state.history:
+    st.chat_message("user" if isinstance(m, HumanMessage) else "assistant").write(m.content)
+
+if q := st.chat_input("Ask about your documents"):
+    st.chat_message("user").write(q)
+    if retriever is None:
+        reply = "No documents indexed yet. Add .txt, .md or .pdf files in the sidebar."
+    else:
+        hits = retriever.invoke(q)
+        reply = chain.invoke({
+            "context": format_docs(hits),
+            "history": st.session_state.history,
+            "question": q,
+        })
+    st.chat_message("assistant").write(reply)
+    st.session_state.history += [HumanMessage(q), AIMessage(reply)]
